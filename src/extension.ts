@@ -4,7 +4,7 @@ import { StatusBarManager } from "./ui/statusBar";
 import { CommandManager } from "./ui/commands";
 import { logger } from "./utils/logger";
 import { MirrorManager } from "./core/mirrorManager";
-import { LogLevel } from "./core/enums";
+import { parseLogLevel } from "./utils/validator";
 
 let mirrorManager: MirrorManager;
 let statusBarManager: StatusBarManager;
@@ -20,7 +20,7 @@ export async function activate(context: vscode.ExtensionContext) {
       autoSwitch: config.get("autoSwitch", true),
       autoCheckInterval: config.get("autoCheckInterval", 30),
       timeout: config.get("timeout", 10000),
-      logLevel: config.get("logLevel", "info") as LogLevel,
+      logLevel: parseLogLevel(config.get("logLevel", "info")),
       mirrorSources: config.get("mirrorSources", [
         "https://raw.githubusercontent.com/MiravaOrg/Mirava/main/mirrors_list.yaml",
       ]),
@@ -67,10 +67,9 @@ export async function activate(context: vscode.ExtensionContext) {
             30,
           );
           extensionConfig.timeout = newConfig.get("timeout", 10000);
-          extensionConfig.logLevel = newConfig.get(
-            "logLevel",
-            "info",
-          ) as LogLevel;
+          extensionConfig.logLevel = parseLogLevel(
+            newConfig.get("logLevel", "info"),
+          );
           logger.setLevel(extensionConfig.logLevel);
           extensionConfig.integrations = newConfig.get(
             "integrations",
@@ -118,7 +117,7 @@ function startBackgroundMonitoring(
         return;
       }
 
-      const checker = (mirrorManager as any).checker;
+      const checker = mirrorManager.getChecker();
       const result = await checker.testMirror(currentMirror);
 
       if (!result.reachable) {

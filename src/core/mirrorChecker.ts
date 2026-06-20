@@ -29,13 +29,15 @@ export class MirrorChecker {
       const latency = Date.now() - startTime;
       const reachable = response.status < 400;
 
-      // Determine status based on latency
+      const HEALTHY_THRESHOLD = 800;
+      const SLOW_THRESHOLD = 2000;
+
       let status: MirrorStatus;
       if (!reachable) {
         status = MirrorStatus.UNAVAILABLE;
-      } else if (latency < 500) {
+      } else if (latency < HEALTHY_THRESHOLD) {
         status = MirrorStatus.HEALTHY;
-      } else if (latency < 1500) {
+      } else if (latency < SLOW_THRESHOLD) {
         status = MirrorStatus.SLOW;
       } else {
         status = MirrorStatus.SLOW;
@@ -94,22 +96,26 @@ export class MirrorChecker {
 
   public findFastestMirror(testResults: MirrorTestResult[]): Mirror | null {
     const healthyMirrors = testResults
-      .filter(
-        (result) =>
-          result.reachable && result.mirror.status !== MirrorStatus.SLOW,
-      )
+      .filter((result) => result.mirror.status === MirrorStatus.HEALTHY)
       .sort((a, b) => a.latency - b.latency);
 
-    if (healthyMirrors.length === 0) {
-      // If no healthy mirrors, try any reachable mirror
-      const reachable = testResults
-        .filter((result) => result.reachable)
-        .sort((a, b) => a.latency - b.latency);
-
-      return reachable.length > 0 ? reachable[0].mirror : null;
+    if (healthyMirrors.length > 0) {
+      return healthyMirrors[0].mirror;
     }
 
-    return healthyMirrors[0].mirror;
+    const slowMirrors = testResults
+      .filter((result) => result.mirror.status === MirrorStatus.SLOW)
+      .sort((a, b) => a.latency - b.latency);
+
+    if (slowMirrors.length > 0) {
+      return slowMirrors[0].mirror;
+    }
+
+    const reachable = testResults
+      .filter((result) => result.reachable)
+      .sort((a, b) => a.latency - b.latency);
+
+    return reachable.length > 0 ? reachable[0].mirror : null;
   }
 
   public async checkPackageOnMirror(
@@ -126,20 +132,20 @@ export class MirrorChecker {
       let url: string;
 
       switch (type) {
-        case "npm":
+        case MirrorType.NPM:
           url = `${mirror.url}${packageName}`;
           break;
-        case "pip":
+        case MirrorType.PIP:
           url = `${mirror.url}${packageName}/`;
           break;
-        case "docker":
+        case MirrorType.DOCKER:
           url = `${mirror.url}v2/${packageName}/tags/list`;
           break;
-        case "maven":
+        case MirrorType.MAVEN:
           url = `${mirror.url}${packageName.replace(/\./g, "/")}/`;
           break;
         default:
-          return true; // General mirrors don't need package verification
+          return true;
       }
 
       const response = await this.axiosInstance.get(url, {

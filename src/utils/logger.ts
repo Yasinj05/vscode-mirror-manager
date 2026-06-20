@@ -34,7 +34,6 @@ class Logger {
 
     const timestamp = new Date().toISOString();
     const levelStr = LOG_LEVEL_MAP[level];
-
     const formatted = `[${timestamp}] [${levelStr}] ${message}`;
 
     this.outputChannel.appendLine(formatted);

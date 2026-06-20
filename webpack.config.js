@@ -18,6 +18,10 @@ const config = {
   },
   resolve: {
     extensions: [".ts", ".js"],
+    alias: {
+      // Fix for debug module
+      "supports-color": false,
+    },
   },
   module: {
     rules: [
