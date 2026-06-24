@@ -32,7 +32,7 @@
       },
       {
         "command": "mirror-manager.switchToFastest",
-        "title": "Mirror Manager: Switch to Fastest Mirror"
+        "title": "Mirror Manager: Switch to Fastest Mirror (by Type)"
       },
       {
         "command": "mirror-manager.diagnose",
@@ -40,7 +40,7 @@
       },
       {
         "command": "mirror-manager.selectManually",
-        "title": "Mirror Manager: Select Mirror Manually"
+        "title": "Mirror Manager: Select Mirror Manually (by Type)"
       },
       {
         "command": "mirror-manager.refreshList",
@@ -52,7 +52,7 @@
       },
       {
         "command": "mirror-manager.resetToDefault",
-        "title": "Mirror Manager: Reset to Default"
+        "title": "Mirror Manager: Reset to Default (by Type)"
       },
       {
         "command": "mirror-manager.exportMirrors",

@@ -5,11 +5,18 @@ import {
   ExtensionConfig,
   MirrorManagerState,
   MirrorTestResult,
+  DEFAULT_MIRRORS,
 } from "./types";
 import { logger } from "../utils/logger";
+import {
+  APPLICABLE_MIRROR_TYPES,
+  filterMirrorsByType,
+  mirrorSupportsType,
+} from "../utils/mirrorTypes";
 import { MirrorStatus, ManagerState, MirrorType } from "./enums";
 import { MirrorChecker } from "./mirrorChecker";
 import { MirrorSourceManager } from "./mirrorSources";
+import { ToolName } from "./types";
 
 export class MirrorManager {
   private checker: MirrorChecker;
@@ -24,6 +31,7 @@ export class MirrorManager {
     this.state = {
       mirrors: [],
       selectedMirror: null,
+      selectedMirrorsByType: new Map(),
       isTesting: false,
       lastTest: null,
       testCache: new Map(),
@@ -62,9 +70,7 @@ export class MirrorManager {
   }
 
   private getDefaultMirrors(): Mirror[] {
-    return [
-      // ... (same as DEFAULT_MIRRORS in types.ts)
-    ];
+    return DEFAULT_MIRRORS.map((mirror) => ({ ...mirror }));
   }
 
   public async testAndSelectBestMirror(): Promise<Mirror | null> {
@@ -107,6 +113,7 @@ export class MirrorManager {
         this.state.selectedMirror = updatedMirror || fastest;
         this.state.lastTest = new Date();
         this.state.status = ManagerState.READY;
+        this.syncSelectedMirrorsByType(this.state.selectedMirror);
         logger.info(
           `Selected fastest mirror: ${this.state.selectedMirror.name} (${this.state.selectedMirror.latency}ms)`,
         );
@@ -140,25 +147,292 @@ export class MirrorManager {
   }
 
   private async applyMirrorToIntegrations(mirror: Mirror): Promise<void> {
-    const integrations = this.config.integrations;
+    const types = this.getApplicableMirrorTypes().filter((type) =>
+      mirrorSupportsType(mirror, type),
+    );
 
-    if (integrations.npm) {
-      await this.applyNpmMirror(mirror);
-    }
-    if (integrations.pip) {
-      await this.applyPipMirror(mirror);
-    }
-    if (integrations.docker) {
-      await this.applyDockerMirror(mirror);
-    }
-    if (integrations.git) {
-      await this.applyGitMirror(mirror);
-    }
-    if (integrations.apt) {
-      await this.applyAptMirror(mirror);
+    const results = await Promise.allSettled(
+      types.map((type) => this.applyMirrorForType(mirror, type)),
+    );
+    results.forEach((result, index) => {
+      if (result.status === "rejected") {
+        logger.warn(
+          `Failed to apply ${types[index]} mirror:`,
+          result.reason,
+        );
+      }
+    });
+
+    logger.info("✅ Mirror integration apply pass completed");
+  }
+
+  public getApplicableMirrorTypes(): ToolName[] {
+    return APPLICABLE_MIRROR_TYPES.filter(
+      (type) =>
+        this.config.integrations[
+          type as keyof typeof this.config.integrations
+        ],
+    );
+  }
+
+  public getMirrorsForType(type: MirrorType): Mirror[] {
+    return filterMirrorsByType(this.state.mirrors, type);
+  }
+
+  public getSelectedMirrorForType(type: MirrorType): Mirror | null {
+    return this.state.selectedMirrorsByType.get(type) ?? null;
+  }
+
+  private syncSelectedMirrorsByType(mirror: Mirror | null): void {
+    if (!mirror) {
+      return;
     }
 
-    logger.info("✅ Applied mirror to all active integrations");
+    for (const type of this.getApplicableMirrorTypes()) {
+      if (mirrorSupportsType(mirror, type)) {
+        this.state.selectedMirrorsByType.set(type, mirror);
+      }
+    }
+  }
+
+  public async testAndSelectBestMirrorForType(
+    type: MirrorType,
+  ): Promise<Mirror | null> {
+    const mirrors = this.getMirrorsForType(type);
+    if (mirrors.length === 0) {
+      logger.warn(`No mirrors available for type: ${type}`);
+      return null;
+    }
+
+    this.state.isTesting = true;
+    this.state.status = ManagerState.TESTING;
+    logger.info(`Testing ${mirrors.length} mirrors for ${type}...`);
+
+    try {
+      const results = await this.checker.testMirrorsParallel(mirrors);
+
+      results.forEach((result: MirrorTestResult) => {
+        this.state.testCache.set(result.mirror.url, result);
+        this.updateMirrorInState(result.mirror);
+      });
+
+      const fastest = this.checker.findFastestMirror(results);
+      if (!fastest) {
+        logger.warn(`No healthy mirrors found for ${type}`);
+        this.state.selectedMirrorsByType.delete(type);
+        return null;
+      }
+
+      const updatedMirror =
+        this.state.mirrors.find((mirror) => mirror.url === fastest.url) ||
+        fastest;
+
+      this.state.selectedMirrorsByType.set(type, updatedMirror);
+      this.state.selectedMirror = updatedMirror;
+      this.state.lastTest = new Date();
+      this.state.status = ManagerState.READY;
+
+      await this.applyMirrorForType(updatedMirror, type);
+
+      logger.info(
+        `Selected fastest ${type} mirror: ${updatedMirror.name} (${updatedMirror.latency}ms)`,
+      );
+      return updatedMirror;
+    } finally {
+      this.state.isTesting = false;
+    }
+  }
+
+  public async selectMirrorForType(
+    url: string,
+    type: MirrorType,
+  ): Promise<Mirror | null> {
+    const mirror = this.state.mirrors.find((item) => item.url === url);
+    if (!mirror) {
+      logger.warn(`Mirror with URL ${url} not found`);
+      return null;
+    }
+
+    if (!mirrorSupportsType(mirror, type)) {
+      logger.warn(`Mirror ${mirror.name} does not support ${type}`);
+      return null;
+    }
+
+    const result = await this.checker.testMirror(mirror);
+    if (!result.reachable) {
+      logger.warn(`Mirror ${mirror.name} is not reachable`);
+      return null;
+    }
+
+    const updatedMirror = this.updateMirrorInState(result.mirror);
+    this.state.selectedMirrorsByType.set(type, updatedMirror);
+    this.state.selectedMirror = updatedMirror;
+    this.state.status = ManagerState.READY;
+
+    await this.applyMirrorForType(updatedMirror, type);
+    return updatedMirror;
+  }
+
+  public async applyMirrorForType(
+    mirror: Mirror,
+    type: MirrorType,
+  ): Promise<void> {
+    if (
+      !this.config.integrations[
+        type as keyof typeof this.config.integrations
+      ]
+    ) {
+      logger.debug(`Skipping ${type} mirror apply (integration disabled)`);
+      return;
+    }
+
+    switch (type) {
+      case MirrorType.NPM:
+        await this.applyNpmMirror(mirror);
+        break;
+      case MirrorType.PIP:
+        await this.applyPipMirror(mirror);
+        break;
+      case MirrorType.DOCKER:
+        await this.applyDockerMirror(mirror);
+        break;
+      case MirrorType.GIT:
+        await this.applyGitMirror(mirror);
+        break;
+      case MirrorType.APT:
+        await this.applyAptMirror(mirror);
+        break;
+      default:
+        logger.debug(`No apply handler for mirror type: ${type}`);
+    }
+  }
+
+  public async resetMirrorType(type: MirrorType): Promise<boolean> {
+    const { exec } = require("child_process");
+
+    switch (type) {
+      case MirrorType.NPM:
+        await new Promise<void>((resolve) => {
+          exec("npm config delete registry", (error: Error | null) => {
+            if (error) {
+              logger.warn("Failed to reset npm:", error.message);
+            } else {
+              logger.info("✅ npm reset to default");
+            }
+            resolve();
+          });
+        });
+        break;
+      case MirrorType.PIP:
+        await new Promise<void>((resolve) => {
+          exec(
+            "pip config unset global.index-url",
+            (error: Error | null) => {
+              if (error) {
+                logger.warn("Failed to reset pip:", error.message);
+              } else {
+                logger.info("✅ pip reset to default");
+              }
+              resolve();
+            },
+          );
+        });
+        break;
+      case MirrorType.GIT:
+        await new Promise<void>((resolve) => {
+          exec(
+            "git config --global --unset url.https://github.com.insteadOf",
+            (error: Error | null) => {
+              if (error) {
+                logger.warn("Failed to reset git:", error.message);
+              } else {
+                logger.info("✅ git reset to default");
+              }
+              resolve();
+            },
+          );
+        });
+        break;
+      case MirrorType.DOCKER:
+        try {
+          const dockerConfigPath =
+            process.platform === "win32"
+              ? "C:\\ProgramData\\docker\\config\\daemon.json"
+              : "/etc/docker/daemon.json";
+
+          if (await fs.pathExists(dockerConfigPath)) {
+            const config = await fs.readJson(dockerConfigPath);
+            if (config["registry-mirrors"]) {
+              delete config["registry-mirrors"];
+              await fs.writeJson(dockerConfigPath, config, { spaces: 2 });
+              logger.info("✅ docker reset to default");
+              logger.warn("⚠️ Docker daemon restart may be required");
+            }
+          }
+        } catch (error) {
+          logger.warn("Failed to reset docker:", error);
+          return false;
+        }
+        break;
+      case MirrorType.APT:
+        try {
+          const sourcesPath = "/etc/apt/sources.list";
+          const backupPath = "/etc/apt/sources.list.bak";
+
+          if (
+            process.platform === "linux" &&
+            (await fs.pathExists(backupPath))
+          ) {
+            await fs.copy(backupPath, sourcesPath);
+            logger.info("✅ apt restored from backup");
+            logger.warn('⚠️ Run "sudo apt update" to apply changes');
+          } else {
+            logger.warn(
+              "⚠️ APT backup not found. Restore sources.list manually if needed.",
+            );
+          }
+        } catch (error) {
+          logger.warn("Failed to reset apt:", error);
+          return false;
+        }
+        break;
+      default:
+        logger.warn(`Reset is not supported for mirror type: ${type}`);
+        return false;
+    }
+
+    this.state.selectedMirrorsByType.delete(type);
+    if (!this.hasAnySelectedMirrorByType()) {
+      this.state.selectedMirror = null;
+    }
+
+    return true;
+  }
+
+  public async resetMirrorTypes(types: MirrorType[]): Promise<void> {
+    for (const type of types) {
+      await this.resetMirrorType(type);
+    }
+  }
+
+  private hasAnySelectedMirrorByType(): boolean {
+    return this.state.selectedMirrorsByType.size > 0;
+  }
+
+  private updateMirrorInState(mirror: Mirror): Mirror {
+    const index = this.state.mirrors.findIndex((item) => item.url === mirror.url);
+    if (index !== -1) {
+      this.state.mirrors[index] = {
+        ...this.state.mirrors[index],
+        status: mirror.status,
+        latency: mirror.latency,
+        error: mirror.error,
+        lastTested: mirror.lastTested,
+      };
+      return this.state.mirrors[index];
+    }
+
+    return mirror;
   }
 
   private async applyNpmMirror(mirror: Mirror): Promise<void> {
@@ -173,7 +447,7 @@ export class MirrorManager {
       const { exec } = require("child_process");
       const command = `npm config set registry ${npmUrl}`;
 
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         exec(
           command,
           (error: Error | null, _stdout: string, stderr: string) => {
@@ -181,7 +455,7 @@ export class MirrorManager {
               logger.error(
                 `❌ Error applying npm mirror: ${stderr || error.message}`,
               );
-              reject(error);
+              resolve();
             } else {
               logger.info(`✅ npm mirror set to ${npmUrl}`);
               this.verifyNpmConfig(npmUrl);
@@ -227,7 +501,7 @@ export class MirrorManager {
       const { exec } = require("child_process");
       const command = `pip config set global.index-url ${pipUrl}`;
 
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         exec(
           command,
           (error: Error | null, _stdout: string, stderr: string) => {
@@ -235,7 +509,7 @@ export class MirrorManager {
               logger.error(
                 `❌ Error applying pip mirror: ${stderr || error.message}`,
               );
-              reject(error);
+              resolve();
             } else {
               logger.info(`✅ pip mirror set to ${pipUrl}`);
               resolve();
@@ -291,7 +565,7 @@ export class MirrorManager {
       const { exec } = require("child_process");
       const command = `git config --global url."${mirror.url}".insteadOf "https://github.com"`;
 
-      return new Promise((resolve, reject) => {
+      return new Promise((resolve) => {
         exec(
           command,
           (error: Error | null, _stdout: string, stderr: string) => {
@@ -299,7 +573,7 @@ export class MirrorManager {
               logger.error(
                 `❌ Error applying git mirror: ${stderr || error.message}`,
               );
-              reject(error);
+              resolve();
             } else {
               logger.info(`✅ Git mirror set to ${mirror.url}`);
               resolve();
@@ -368,36 +642,34 @@ export class MirrorManager {
   }
 
   public async selectMirrorManually(url: string): Promise<Mirror | null> {
-    const mirror = this.state.mirrors.find((m) => m.url === url);
+    const enabledTypes = this.getApplicableMirrorTypes();
+    if (enabledTypes.length === 1) {
+      return this.selectMirrorForType(url, enabledTypes[0]);
+    }
+
+    const mirror = this.state.mirrors.find((item) => item.url === url);
     if (!mirror) {
       logger.warn(`Mirror with URL ${url} not found`);
       return null;
     }
 
-    const result = await this.checker.testMirror(mirror);
-    if (result.reachable) {
-      const index = this.state.mirrors.findIndex((m) => m.url === url);
-      if (index !== -1) {
-        this.state.mirrors[index] = {
-          ...this.state.mirrors[index],
-          status: result.mirror.status,
-          latency: result.mirror.latency,
-          error: result.mirror.error,
-          lastTested: result.mirror.lastTested,
-        };
-        this.state.selectedMirror = this.state.mirrors[index];
-      } else {
-        this.state.selectedMirror = result.mirror;
-      }
-      this.state.status = ManagerState.READY;
-
-      await this.applyMirrorToIntegrations(this.state.selectedMirror);
-
-      return this.state.selectedMirror;
-    } else {
-      logger.warn(`Mirror ${mirror.name} is not reachable`);
+    const supportedTypes = enabledTypes.filter((type) =>
+      mirrorSupportsType(mirror, type),
+    );
+    if (supportedTypes.length === 0) {
+      logger.warn(`Mirror ${mirror.name} does not support any enabled type`);
       return null;
     }
+
+    if (supportedTypes.length === 1) {
+      return this.selectMirrorForType(url, supportedTypes[0]);
+    }
+
+    for (const type of supportedTypes) {
+      await this.selectMirrorForType(url, type);
+    }
+
+    return this.state.selectedMirror;
   }
 
   public getChecker(): MirrorChecker {

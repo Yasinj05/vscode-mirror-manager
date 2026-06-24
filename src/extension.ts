@@ -11,85 +11,105 @@ let statusBarManager: StatusBarManager;
 let commandManager: CommandManager;
 
 export async function activate(context: vscode.ExtensionContext) {
-  logger.info("🚀 Mirror Manager is now active!");
+  logger.initialize(context);
+  logger.section("Extension Activation", { show: false });
+  logger.info("Mirror Manager is now active!");
 
+  const config = vscode.workspace.getConfiguration("mirror-manager");
+  const extensionConfig: ExtensionConfig = {
+    enabled: config.get("enable", true),
+    autoSwitch: config.get("autoSwitch", true),
+    autoCheckInterval: config.get("autoCheckInterval", 30),
+    timeout: config.get("timeout", 10000),
+    logLevel: parseLogLevel(config.get("logLevel", "info")),
+    mirrorSources: config.get("mirrorSources", [
+      "https://raw.githubusercontent.com/MiravaOrg/Mirava/main/mirrors_list.yaml",
+    ]),
+    integrations: config.get("integrations", {
+      npm: true,
+      pip: true,
+      docker: true,
+      git: true,
+      apt: false,
+      maven: false,
+      go: false,
+      composer: false,
+      nuget: false,
+      rubygems: false,
+      cargo: false,
+    }),
+    profiles: [],
+  };
+
+  logger.setLevel(extensionConfig.logLevel);
+
+  mirrorManager = new MirrorManager(extensionConfig);
+  statusBarManager = new StatusBarManager(mirrorManager);
+  commandManager = new CommandManager(mirrorManager, statusBarManager);
+
+  commandManager.registerCommands(context);
+  statusBarManager.initialize(context);
+
+  const configChangeListener = vscode.workspace.onDidChangeConfiguration(
+    async (event) => {
+      if (event.affectsConfiguration("mirror-manager")) {
+        logger.section("Configuration Changed");
+        logger.info("Reloading settings and mirrors...");
+        const newConfig = vscode.workspace.getConfiguration("mirror-manager");
+        extensionConfig.enabled = newConfig.get("enable", true);
+        extensionConfig.autoSwitch = newConfig.get("autoSwitch", true);
+        extensionConfig.autoCheckInterval = newConfig.get(
+          "autoCheckInterval",
+          30,
+        );
+        extensionConfig.timeout = newConfig.get("timeout", 10000);
+        extensionConfig.logLevel = parseLogLevel(
+          newConfig.get("logLevel", "info"),
+        );
+        logger.setLevel(extensionConfig.logLevel);
+        extensionConfig.integrations = newConfig.get(
+          "integrations",
+          extensionConfig.integrations,
+        );
+        extensionConfig.mirrorSources = newConfig.get(
+          "mirrorSources",
+          extensionConfig.mirrorSources,
+        );
+
+        try {
+          await mirrorManager.refreshMirrors();
+          statusBarManager.updateStatus();
+          logger.sectionEnd("Settings reloaded");
+        } catch (error) {
+          logger.error("Failed to refresh mirrors after config change:", error);
+          logger.sectionEnd("Reload failed");
+        }
+      }
+    },
+  );
+  context.subscriptions.push(configChangeListener);
+
+  void initializeMirrorManager(context, extensionConfig);
+}
+
+async function initializeMirrorManager(
+  context: vscode.ExtensionContext,
+  extensionConfig: ExtensionConfig,
+): Promise<void> {
   try {
-    const config = vscode.workspace.getConfiguration("mirror-manager");
-    const extensionConfig: ExtensionConfig = {
-      enabled: config.get("enable", true),
-      autoSwitch: config.get("autoSwitch", true),
-      autoCheckInterval: config.get("autoCheckInterval", 30),
-      timeout: config.get("timeout", 10000),
-      logLevel: parseLogLevel(config.get("logLevel", "info")),
-      mirrorSources: config.get("mirrorSources", [
-        "https://raw.githubusercontent.com/MiravaOrg/Mirava/main/mirrors_list.yaml",
-      ]),
-      integrations: config.get("integrations", {
-        npm: true,
-        pip: true,
-        docker: true,
-        git: true,
-        apt: false,
-        maven: false,
-        go: false,
-        composer: false,
-        nuget: false,
-        rubygems: false,
-        cargo: false,
-      }),
-      profiles: [],
-    };
-
-    logger.setLevel(extensionConfig.logLevel);
-
-    mirrorManager = new MirrorManager(extensionConfig);
     await mirrorManager.initialize();
-
-    statusBarManager = new StatusBarManager(mirrorManager);
-    statusBarManager.initialize();
-
-    commandManager = new CommandManager(mirrorManager, statusBarManager);
-    commandManager.registerCommands(context);
+    statusBarManager.updateStatus();
 
     if (extensionConfig.enabled && extensionConfig.autoSwitch) {
       startBackgroundMonitoring(context, extensionConfig);
     }
 
-    const configChangeListener = vscode.workspace.onDidChangeConfiguration(
-      async (event) => {
-        if (event.affectsConfiguration("mirror-manager")) {
-          logger.info("Configuration changed, reloading...");
-          const newConfig = vscode.workspace.getConfiguration("mirror-manager");
-          extensionConfig.enabled = newConfig.get("enable", true);
-          extensionConfig.autoSwitch = newConfig.get("autoSwitch", true);
-          extensionConfig.autoCheckInterval = newConfig.get(
-            "autoCheckInterval",
-            30,
-          );
-          extensionConfig.timeout = newConfig.get("timeout", 10000);
-          extensionConfig.logLevel = parseLogLevel(
-            newConfig.get("logLevel", "info"),
-          );
-          logger.setLevel(extensionConfig.logLevel);
-          extensionConfig.integrations = newConfig.get(
-            "integrations",
-            extensionConfig.integrations,
-          );
-          extensionConfig.mirrorSources = newConfig.get(
-            "mirrorSources",
-            extensionConfig.mirrorSources,
-          );
-
-          await mirrorManager.refreshMirrors();
-          statusBarManager.updateStatus();
-        }
-      },
-    );
-    context.subscriptions.push(configChangeListener);
-
-    logger.info("✅ Mirror Manager initialized successfully");
+    logger.info("Mirror Manager initialized successfully");
+    logger.sectionEnd("Ready");
   } catch (error) {
     logger.error("Failed to initialize Mirror Manager:", error);
+    statusBarManager.updateStatus();
+    logger.sectionEnd("Initialization failed");
     vscode.window.showErrorMessage(
       "Failed to initialize Mirror Manager. Check the output panel for details.",
     );
@@ -121,15 +141,20 @@ function startBackgroundMonitoring(
       const result = await checker.testMirror(currentMirror);
 
       if (!result.reachable) {
-        logger.warn(`⚠️ Current mirror ${currentMirror.name} is unavailable!`);
+        logger.section("Background Monitor");
+        logger.warn(`Current mirror ${currentMirror.name} is unavailable`);
         const newMirror = await mirrorManager.testAndSelectBestMirror();
         statusBarManager.updateStatus();
 
         if (newMirror) {
+          logger.info(`Switched to ${newMirror.name}`);
+          logger.sectionEnd("Recovered");
           vscode.window.showWarningMessage(
             `Mirror ${currentMirror.name} became unavailable. Switched to ${newMirror.name}.`,
           );
         } else {
+          logger.error("No healthy mirrors available");
+          logger.sectionEnd("Recovery failed");
           vscode.window.showErrorMessage(
             "No healthy mirrors available! Please check your internet connection.",
           );
@@ -147,11 +172,13 @@ function startBackgroundMonitoring(
           fastest.latency &&
           fastest.latency < (result.latency || 0) / 2
         ) {
+          logger.section("Background Monitor");
           logger.info(
-            `🔄 Found faster mirror: ${fastest.name} (${fastest.latency}ms)`,
+            `Found faster mirror: ${fastest.name} (${fastest.latency}ms)`,
           );
           await mirrorManager.selectMirrorManually(fastest.url);
           statusBarManager.updateStatus();
+          logger.sectionEnd("Switched to faster mirror");
 
           vscode.window.showInformationMessage(
             `Switched to faster mirror: ${fastest.name} (${fastest.latency}ms)`,
@@ -168,10 +195,13 @@ function startBackgroundMonitoring(
   });
 
   logger.info(
-    `🔄 Background monitoring started (interval: ${intervalMinutes} minutes)`,
+    `Background monitoring started (every ${intervalMinutes} min)`,
   );
 }
 
 export function deactivate() {
-  logger.info("👋 Mirror Manager is now deactivated");
+  statusBarManager?.dispose();
+  logger.section("Extension Deactivated");
+  logger.info("Mirror Manager stopped");
+  logger.sectionEnd();
 }

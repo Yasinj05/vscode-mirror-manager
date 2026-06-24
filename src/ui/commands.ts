@@ -4,7 +4,8 @@ import { logger } from "../utils/logger";
 import { MirrorManager } from "../core/mirrorManager";
 import { StatusBarManager } from "./statusBar";
 import { MirrorStatus, MirrorType } from "../core/enums";
-import { Mirror } from "../core/types";
+import { Mirror, ToolName } from "../core/types";
+import { getMirrorTypeLabel } from "../utils/mirrorTypes";
 
 export class CommandManager {
   private mirrorManager: MirrorManager;
@@ -135,17 +136,102 @@ export class CommandManager {
     );
   }
 
+  private async pickMirrorType(
+    placeHolder: string,
+  ): Promise<ToolName | undefined> {
+    const types = this.mirrorManager.getApplicableMirrorTypes();
+    if (types.length === 0) {
+      vscode.window.showWarningMessage(
+        "No mirror integrations are enabled. Enable them in Mirror Manager settings.",
+      );
+      return undefined;
+    }
+
+    const selected = await vscode.window.showQuickPick(
+      types.map((type) => ({
+        label: getMirrorTypeLabel(type),
+        description: `Switch mirror for ${getMirrorTypeLabel(type)}`,
+        type,
+      })),
+      { placeHolder },
+    );
+
+    return selected?.type;
+  }
+
+  private async pickMirrorTypesForReset(): Promise<ToolName[] | undefined> {
+    const types = this.mirrorManager.getApplicableMirrorTypes();
+    if (types.length === 0) {
+      vscode.window.showWarningMessage(
+        "No mirror integrations are enabled. Enable them in Mirror Manager settings.",
+      );
+      return undefined;
+    }
+
+    const items = [
+      {
+        label: "All integrations",
+        description: "Reset npm, pip, docker, git, and apt settings",
+        type: "all" as const,
+        picked: false,
+      },
+      ...types.map((type) => ({
+        label: getMirrorTypeLabel(type),
+        description: `Reset only ${getMirrorTypeLabel(type)} to default`,
+        type,
+        picked: false,
+      })),
+    ];
+
+    const selected = await vscode.window.showQuickPick(items, {
+      placeHolder: "Select mirror type(s) to reset",
+      canPickMany: true,
+    });
+
+    if (!selected || selected.length === 0) {
+      return undefined;
+    }
+
+    if (selected.some((item) => item.type === "all")) {
+      return types;
+    }
+
+    return selected.map((item) => item.type as ToolName);
+  }
+
+  private beginCommand(title: string): void {
+    logger.section(title);
+  }
+
+  private endCommand(status = "Done"): void {
+    logger.sectionEnd(status);
+  }
+
   private async showStatus(): Promise<void> {
+    this.beginCommand("Show Status");
     try {
       const status = this.mirrorManager.getStatus();
       const selectedMirror = status.selectedMirror;
 
       let message = "Mirror Manager Status:\n";
       message += `\n📊 Total Mirrors: ${status.mirrors.length}`;
-      message += `\n🔍 Selected: ${selectedMirror ? selectedMirror.name : "None"}`;
+
+      const applicableTypes = this.mirrorManager.getApplicableMirrorTypes();
+      if (applicableTypes.length > 0) {
+        message += "\n\n🔍 Selected mirrors by type:";
+        for (const type of applicableTypes) {
+          const mirror = this.mirrorManager.getSelectedMirrorForType(type);
+          if (mirror) {
+            message += `\n   ${getMirrorTypeLabel(type)}: ${mirror.name} (${mirror.latency || "N/A"}ms)`;
+            message += `\n      ${mirror.url}`;
+          } else {
+            message += `\n   ${getMirrorTypeLabel(type)}: None`;
+          }
+        }
+      }
 
       if (selectedMirror) {
-        message += `\n   📍 URL: ${selectedMirror.url}`;
+        message += `\n\n⭐ Last active mirror: ${selectedMirror.name}`;
         message += `\n   ⚡ Latency: ${selectedMirror.latency || "N/A"}ms`;
         message += `\n   📊 Status: ${selectedMirror.status}`;
       }
@@ -158,42 +244,62 @@ export class CommandManager {
         modal: false,
       });
 
-      logger.info(message);
-      logger.show();
+      logger.blank();
+      logger.block(message);
+      this.endCommand("Status displayed");
     } catch (error) {
       logger.error("Error showing status:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to get mirror status");
     }
   }
 
   private async switchToFastest(): Promise<void> {
     try {
+      const mirrorType = await this.pickMirrorType(
+        "Select mirror type to switch",
+      );
+      if (!mirrorType) {
+        return;
+      }
+
+      this.beginCommand(
+        `Switch to Fastest (${getMirrorTypeLabel(mirrorType)})`,
+      );
+
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: "Testing mirrors...",
+          title: `Testing ${getMirrorTypeLabel(mirrorType)} mirrors...`,
           cancellable: false,
         },
         async () => {
-          const fastest = await this.mirrorManager.testAndSelectBestMirror();
+          const fastest =
+            await this.mirrorManager.testAndSelectBestMirrorForType(mirrorType);
 
           if (fastest) {
             vscode.window.showInformationMessage(
-              `✅ Switched to fastest mirror: ${fastest.name} (${fastest.latency}ms)`,
+              `✅ Switched ${getMirrorTypeLabel(mirrorType)} to fastest mirror: ${fastest.name} (${fastest.latency}ms)`,
             );
             this.statusBarManager.updateStatus();
+            this.endCommand(`Selected ${fastest.name}`);
           } else {
-            vscode.window.showErrorMessage("❌ No healthy mirrors found!");
+            this.endCommand("No healthy mirrors");
+            vscode.window.showErrorMessage(
+              `❌ No healthy ${getMirrorTypeLabel(mirrorType)} mirrors found!`,
+            );
           }
         },
       );
     } catch (error) {
       logger.error("Error switching to fastest mirror:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to switch to fastest mirror");
     }
   }
 
   private async diagnose(): Promise<void> {
+    this.beginCommand("Diagnostic Report");
     try {
       const status = this.mirrorManager.getStatus();
       const mirrors = status.mirrors;
@@ -252,52 +358,81 @@ export class CommandManager {
         report += "\n";
       }
 
-      logger.info(report);
-      logger.show();
+      logger.blank();
+      logger.block(report);
 
       vscode.window.showInformationMessage(
         "✅ Diagnostic report generated. Check Output panel.",
       );
+      this.endCommand("Report generated");
     } catch (error) {
       logger.error("Error running diagnose:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to run diagnosis");
     }
   }
 
   private async selectManually(): Promise<void> {
     try {
-      const mirrors = this.mirrorManager.getAllMirrors();
-      const items = mirrors.map((m) => ({
-        label: `${m.name} (${m.latency || "N/A"}ms)`,
-        description: m.url,
-        url: m.url,
+      const mirrorType = await this.pickMirrorType(
+        "Select mirror type to configure",
+      );
+      if (!mirrorType) {
+        return;
+      }
+
+      this.beginCommand(
+        `Select Mirror (${getMirrorTypeLabel(mirrorType)})`,
+      );
+
+      const mirrors = this.mirrorManager.getMirrorsForType(mirrorType);
+      if (mirrors.length === 0) {
+        logger.warn(`No mirrors available for ${getMirrorTypeLabel(mirrorType)}`);
+        this.endCommand("No mirrors found");
+        vscode.window.showWarningMessage(
+          `No mirrors available for ${getMirrorTypeLabel(mirrorType)}.`,
+        );
+        return;
+      }
+
+      const items = mirrors.map((mirror) => ({
+        label: `${mirror.name} (${mirror.latency || "N/A"}ms)`,
+        description: mirror.url,
+        url: mirror.url,
       }));
 
       const selected = await vscode.window.showQuickPick(items, {
-        placeHolder: "Select a mirror to use",
+        placeHolder: `Select a ${getMirrorTypeLabel(mirrorType)} mirror`,
         matchOnDescription: true,
       });
 
       if (selected) {
-        const result = await this.mirrorManager.selectMirrorManually(
+        const result = await this.mirrorManager.selectMirrorForType(
           selected.url,
+          mirrorType,
         );
         if (result) {
           vscode.window.showInformationMessage(
-            `✅ Selected mirror: ${result.name}`,
+            `✅ Selected ${getMirrorTypeLabel(mirrorType)} mirror: ${result.name}`,
           );
           this.statusBarManager.updateStatus();
+          this.endCommand(`Selected ${result.name}`);
         } else {
+          this.endCommand("Mirror unreachable");
           vscode.window.showErrorMessage("❌ Mirror is not reachable");
         }
+      } else {
+        this.endCommand("Cancelled");
       }
     } catch (error) {
       logger.error("Error selecting mirror manually:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to select mirror");
     }
   }
 
   private async refreshList(): Promise<void> {
+    this.beginCommand("Refresh Mirrors");
     try {
       await vscode.window.withProgress(
         {
@@ -311,15 +446,18 @@ export class CommandManager {
           vscode.window.showInformationMessage(
             "✅ Mirrors list refreshed successfully!",
           );
+          this.endCommand("List refreshed");
         },
       );
     } catch (error) {
       logger.error("Error refreshing mirrors:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to refresh mirrors");
     }
   }
 
   private async disable(): Promise<void> {
+    this.beginCommand("Toggle Extension");
     try {
       const config = vscode.workspace.getConfiguration("mirror-manager");
       const current = config.get("enable", true);
@@ -334,16 +472,24 @@ export class CommandManager {
       );
 
       this.statusBarManager.updateStatus();
+      this.endCommand(current ? "Disabled" : "Enabled");
     } catch (error) {
       logger.error("Error disabling/enabling:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to change state");
     }
   }
 
   private async resetToDefault(): Promise<void> {
     try {
+      const types = await this.pickMirrorTypesForReset();
+      if (!types || types.length === 0) {
+        return;
+      }
+
+      const typeLabels = types.map((type) => getMirrorTypeLabel(type)).join(", ");
       const confirm = await vscode.window.showWarningMessage(
-        "This will reset npm, pip, docker, and git to their default settings. Continue?",
+        `Reset ${typeLabels} to default settings?`,
         { modal: true },
         "Yes",
         "Cancel",
@@ -353,81 +499,27 @@ export class CommandManager {
         return;
       }
 
+      this.beginCommand(`Reset to Default (${typeLabels})`);
+
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
-          title: "Resetting to default settings...",
+          title: "Resetting mirror settings...",
           cancellable: false,
         },
         async () => {
-          const { exec } = require("child_process");
-
-          await new Promise((resolve) => {
-            exec("npm config delete registry", (error: Error | null) => {
-              if (error) {
-                logger.warn("Failed to reset npm:", error.message);
-              } else {
-                logger.info("✅ npm reset to default");
-              }
-              resolve(null);
-            });
-          });
-
-          await new Promise((resolve) => {
-            exec("pip config unset global.index-url", (error: Error | null) => {
-              if (error) {
-                logger.warn("Failed to reset pip:", error.message);
-              } else {
-                logger.info("✅ pip reset to default");
-              }
-              resolve(null);
-            });
-          });
-
-          await new Promise((resolve) => {
-            exec(
-              "git config --global --unset url.https://github.com.insteadOf",
-              (error: Error | null) => {
-                if (error) {
-                  logger.warn("Failed to reset git:", error.message);
-                } else {
-                  logger.info("✅ git reset to default");
-                }
-                resolve(null);
-              },
-            );
-          });
-
-          try {
-            const dockerConfigPath =
-              process.platform === "win32"
-                ? "C:\\ProgramData\\docker\\config\\daemon.json"
-                : "/etc/docker/daemon.json";
-
-            if (await fs.pathExists(dockerConfigPath)) {
-              const config = await fs.readJson(dockerConfigPath);
-              if (config["registry-mirrors"]) {
-                delete config["registry-mirrors"];
-                await fs.writeJson(dockerConfigPath, config, { spaces: 2 });
-                logger.info("✅ docker reset to default");
-                logger.warn("⚠️ Docker daemon restart may be required");
-              }
-            }
-          } catch (error) {
-            logger.warn("Failed to reset docker:", error);
-          }
-
-          const status = this.mirrorManager.getStatus();
-          status.selectedMirror = null;
+          await this.mirrorManager.resetMirrorTypes(types);
           this.statusBarManager.updateStatus();
 
           vscode.window.showInformationMessage(
-            "✅ All tools reset to default settings!",
+            `✅ Reset to default: ${typeLabels}`,
           );
+          this.endCommand("Reset complete");
         },
       );
     } catch (error) {
       logger.error("Error resetting to default:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to reset to default settings");
     }
   }
@@ -452,6 +544,8 @@ export class CommandManager {
       });
 
       if (!uri) return;
+
+      this.beginCommand("Export Mirrors");
 
       let content = "";
       switch (format) {
@@ -480,6 +574,9 @@ export class CommandManager {
       }
 
       await fs.writeFile(uri.fsPath, content);
+      logger.info(`Exported ${mirrors.length} mirrors as ${format}`);
+      logger.info(`Saved to: ${uri.fsPath}`);
+      this.endCommand("Export complete");
       vscode.window.showInformationMessage(
         `✅ Mirrors exported to ${uri.fsPath}`,
       );
@@ -509,28 +606,35 @@ export class CommandManager {
 
       if (!selected) return;
 
+      this.beginCommand(`Filter Mirrors (${selected})`);
+
       const filtered = allMirrors.filter((m) =>
         m.type.some((t) => t.toLowerCase() === selected.toLowerCase()),
       );
 
       if (filtered.length === 0) {
+        logger.warn(`No mirrors found for type: ${selected}`);
+        this.endCommand("No results");
         vscode.window.showInformationMessage(
           `No mirrors found for type: ${selected}`,
         );
         return;
       }
 
-      let message = `📊 Mirrors supporting ${selected}:\n\n`;
+      let message = `Mirrors supporting ${selected}:\n\n`;
       message += filtered
         .map((m) => `  • ${m.name} (${m.latency || "N/A"}ms) - ${m.status}`)
         .join("\n");
 
+      logger.block(message);
       vscode.window.showInformationMessage(message, {
         modal: true,
         detail: message,
       });
+      this.endCommand(`${filtered.length} mirrors`);
     } catch (error) {
       logger.error("Error filtering mirrors:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to filter mirrors");
     }
   }
@@ -556,10 +660,12 @@ export class CommandManager {
       }
 
       const [first, second] = selected;
-      let message = "🔍 Mirror Comparison:\n\n";
-      message += `📌 ${first.label}\n`;
+      this.beginCommand("Compare Mirrors");
+
+      let message = "Mirror Comparison:\n\n";
+      message += `${first.label}\n`;
       message += `   URL: ${first.description}\n\n`;
-      message += `📌 ${second.label}\n`;
+      message += `${second.label}\n`;
       message += `   URL: ${second.description}\n\n`;
 
       const firstMirror = mirrors.find((m) => m.url === first.url);
@@ -571,31 +677,37 @@ export class CommandManager {
           firstMirror.latency < secondMirror.latency
             ? firstMirror.name
             : secondMirror.name;
-        message += `⚡ Latency Difference: ${diff}ms\n`;
-        message += `🏆 Faster: ${faster}`;
+        message += `Latency difference: ${diff}ms\n`;
+        message += `Faster: ${faster}`;
       }
 
+      logger.block(message);
       vscode.window.showInformationMessage(message, {
         modal: true,
         detail: message,
       });
+      this.endCommand("Comparison complete");
     } catch (error) {
       logger.error("Error comparing mirrors:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to compare mirrors");
     }
   }
 
   private async showHistory(): Promise<void> {
+    this.beginCommand("Test History");
     try {
       const status = this.mirrorManager.getStatus();
       const history = status.testCache;
 
       if (history.size === 0) {
+        logger.info("No mirror history available yet");
+        this.endCommand("Empty");
         vscode.window.showInformationMessage("No mirror history available");
         return;
       }
 
-      let message = "📊 Mirror Test History:\n\n";
+      let message = "Mirror Test History:\n\n";
       let index = 1;
       for (const [url, result] of history) {
         message += `${index}. ${result.mirror.name}\n`;
@@ -606,12 +718,15 @@ export class CommandManager {
         index++;
       }
 
+      logger.block(message);
       vscode.window.showInformationMessage(message, {
         modal: true,
         detail: message,
       });
+      this.endCommand(`${history.size} entries`);
     } catch (error) {
       logger.error("Error showing history:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to show history");
     }
   }
@@ -654,12 +769,16 @@ export class CommandManager {
 
       if (!uri) return;
 
+      this.beginCommand("Export Diagnostic");
       await fs.writeFile(uri.fsPath, report);
+      logger.info(`Report saved to: ${uri.fsPath}`);
+      this.endCommand("Export complete");
       vscode.window.showInformationMessage(
         `✅ Diagnostic report saved to ${uri.fsPath}`,
       );
     } catch (error) {
       logger.error("Error exporting diagnostic:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to export diagnostic");
     }
   }
@@ -685,6 +804,8 @@ export class CommandManager {
         return;
       }
 
+      this.beginCommand(`Batch Test (${selected.length} mirrors)`);
+
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,
@@ -701,20 +822,23 @@ export class CommandManager {
 
           const results = await checker.testMirrorsParallel(mirrorsToTest);
 
-          let message = "📊 Test Results:\n\n";
+          let message = "Test Results:\n\n";
           for (const result of results) {
-            const icon = result.reachable ? "✅" : "❌";
-            message += `${icon} ${result.mirror.name}: ${result.latency}ms\n`;
+            const icon = result.reachable ? "OK" : "FAIL";
+            message += `[${icon}] ${result.mirror.name}: ${result.latency}ms\n`;
           }
 
+          logger.block(message);
           vscode.window.showInformationMessage(message, {
             modal: true,
             detail: message,
           });
+          this.endCommand(`${results.length} mirrors tested`);
         },
       );
     } catch (error) {
       logger.error("Error batch testing mirrors:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to test mirrors");
     }
   }
@@ -748,6 +872,8 @@ export class CommandManager {
 
       if (!type) return;
 
+      this.beginCommand("Add Custom Mirror");
+
       const newMirror: Mirror = {
         url,
         name,
@@ -759,9 +885,14 @@ export class CommandManager {
       status.mirrors.push(newMirror);
       this.statusBarManager.updateStatus();
 
+      logger.info(`Added custom mirror: ${name} (${type})`);
+      logger.info(`URL: ${url}`);
+      this.endCommand("Mirror added");
+
       vscode.window.showInformationMessage(`✅ Custom mirror added: ${name}`);
     } catch (error) {
       logger.error("Error adding custom mirror:", error);
+      this.endCommand("Failed");
       vscode.window.showErrorMessage("Failed to add custom mirror");
     }
   }

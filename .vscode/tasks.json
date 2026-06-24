@@ -4,10 +4,25 @@
     {
       "type": "npm",
       "script": "watch",
-      "problemMatcher": "$tsc-watch",
+      "label": "npm: watch",
       "isBackground": true,
+      "problemMatcher": {
+        "owner": "webpack",
+        "pattern": {
+          "regexp": "^\\s*$",
+          "file": 1,
+          "location": 2,
+          "message": 3
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Compiler starting",
+          "endsPattern": "compiled successfully|compiled with"
+        }
+      },
       "presentation": {
-        "reveal": "never"
+        "reveal": "silent",
+        "panel": "shared"
       },
       "group": {
         "kind": "build",
@@ -17,12 +32,14 @@
     {
       "type": "npm",
       "script": "compile",
+      "label": "npm: compile",
       "group": "build",
       "problemMatcher": []
     },
     {
       "type": "npm",
       "script": "test",
+      "label": "npm: test",
       "group": "test",
       "problemMatcher": []
     }

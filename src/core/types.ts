@@ -77,6 +77,7 @@ export interface HealthCheckResult {
 export interface MirrorManagerState {
   mirrors: Mirror[];
   selectedMirror: Mirror | null;
+  selectedMirrorsByType: Map<MirrorType, Mirror>;
   isTesting: boolean;
   lastTest: Date | null;
   testCache: Map<string, MirrorTestResult>;
